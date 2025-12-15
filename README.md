@@ -47,5 +47,4 @@ The pipeline is split into 3 steps:
 - **Scraper**: Configured to ignore non-English pages and static assets (PDF/images) to keep the index clean.
 - **Rate Limits**: The ingest script has a small delay between batches if running in local mode, though the GroundX crawler handles most of this.
 
----
-*Created for ITNB AI Engineering Assessment*
+- **Rate Limits**: The ingest script has a small delay between batches if running in local mode, though the GroundX crawler handles most of this.
