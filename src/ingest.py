@@ -1,5 +1,6 @@
 """
 GroundX document ingestion pipeline.
+Reads locally scraped content and uploads to GroundX.
 """
 
 import json
@@ -8,10 +9,10 @@ from pathlib import Path
 from typing import Optional
 
 from groundx import GroundX
-from groundx.types import WebsiteSource
+from groundx.types import Document
 from loguru import logger
 from rich.console import Console
-from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn
+from rich.progress import Progress, BarColumn, TextColumn, TaskProgressColumn
 from rich.table import Table
 
 from .config import get_config
@@ -20,7 +21,7 @@ console = Console()
 
 
 class GroundXIngestor:
-    """Pipelines documents into GroundX."""
+    """Ingests locally scraped documents into GroundX."""
     
     def __init__(self, api_key: Optional[str] = None):
         config = get_config()
@@ -31,20 +32,18 @@ class GroundXIngestor:
         
         self.client = GroundX(api_key=self.api_key)
         self.bucket_id: Optional[int] = None
-        self.process_id: Optional[str] = None
         
         self.stats = {"total": 0, "success": 0, "failed": 0}
+        self.results: list[dict] = []  # Per-document audit trail
     
     def get_or_create_bucket(self, bucket_name: str = "itnb-website-content") -> int:
         """Finds or creates a working bucket."""
         try:
-            # Check existing first
             for bucket in self.client.buckets.list().buckets:
                 if bucket.name == bucket_name:
                     logger.info(f"Using existing bucket: {bucket_name} ({bucket.bucket_id})")
                     return bucket.bucket_id
             
-            # Create new
             response = self.client.buckets.create(name=bucket_name)
             logger.info(f"Created bucket: {bucket_name} ({response.bucket.bucket_id})")
             return response.bucket.bucket_id
@@ -53,145 +52,131 @@ class GroundXIngestor:
             logger.error(f"Bucket op failed: {e}")
             raise
     
-    def ingest_website(self, base_url: str = "https://www.itnb.ch/en", depth: int = 3, cap: int = 50) -> dict:
+    def ingest_from_json(self, json_path: Path = Path("data/itnb_scraped_content.json")) -> dict:
         """
-        Ingest website using GroundX crawler.
-        Uses their native crawl API which handles the scraping internally.
+        Ingest documents from locally scraped JSON file.
+        Creates temp .txt files and uploads via GroundX SDK.
         """
-        console.print(f"\n[bold blue]GroundX Website Ingestion[/bold blue]")
-        console.print(f"URL: {base_url}")
-        console.print(f"Depth: {depth}, Cap: {cap} pages\n")
+        if not json_path.exists():
+            raise FileNotFoundError(f"Scraped data not found: {json_path}. Run scraper first.")
         
-        self.bucket_id = self.get_or_create_bucket()
-        
-        try:
-            website = WebsiteSource(
-                bucket_id=self.bucket_id,
-                source_url=base_url,
-                depth=depth,
-                cap=cap,
-                search_data={
-                    "source": "itnb_website",
-                    "language": "en",
-                }
-            )
-            
-            console.print("Starting crawl...")
-            response = self.client.documents.crawl_website(websites=[website])
-            
-            if response and response.ingest:
-                self.process_id = response.ingest.process_id
-                console.print(f"Crawl started. Process ID: {self.process_id}")
-                
-                # poll for completion
-                self._wait_for_completion()
-                self.stats["success"] = 1
-                return self.stats
-            else:
-                logger.error("No response from crawl API")
-                self.stats["failed"] = 1
-                return self.stats
-                
-        except Exception as e:
-            logger.error(f"Crawl failed: {e}")
-            self.stats["failed"] = 1
-            raise
-    
-    def _wait_for_completion(self, timeout_minutes: int = 10):
-        """Poll for crawl completion."""
-        if not self.process_id:
-            return
-        
-        start = time.time()
-        timeout = timeout_minutes * 60
-        
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Processing...", total=None)
-            
-            while time.time() - start < timeout:
-                try:
-                    status = self.client.documents.get_processing_status_by_id(self.process_id)
-                    
-                    if status and status.ingest:
-                        state = status.ingest.status
-                        progress.update(task, description=f"Status: {state}")
-                        
-                        if state == "complete":
-                            console.print("[green]✓ Crawl complete[/green]")
-                            return
-                        elif state == "error":
-                            console.print("[red]✗ Crawl failed[/red]")
-                            return
-                        elif state in ("cancelled",):
-                            console.print(f"[yellow]Crawl {state}[/yellow]")
-                            return
-                    
-                    time.sleep(5)
-                    
-                except Exception as e:
-                    logger.warning(f"Status check error: {e}")
-                    time.sleep(5)
-        
-        console.print("[yellow]Timeout waiting for completion[/yellow]")
-    
-    def ingest_from_json(self, json_path: Path) -> dict:
-        """
-        Alternative: ingest URLs from scraped JSON using crawl API.
-        Batches URLs for crawl.
-        """
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         
         documents = data.get("documents", [])
-        urls = [doc["url"] for doc in documents if doc["url"].startswith("https://www.itnb.ch")]
+        self.stats["total"] = len(documents)
         
-        self.stats["total"] = len(urls)
-        
-        console.print(f"\n[bold blue]GroundX Ingestion[/bold blue]")
+        console.print(f"\n[bold blue]GroundX Document Ingestion[/bold blue]")
         console.print(f"Source: {json_path}")
-        console.print(f"URLs: {len(urls)}\n")
+        console.print(f"Documents: {len(documents)}\n")
         
         self.bucket_id = self.get_or_create_bucket()
         
-        # batch by 10
-        batch_size = 10
-        for i in range(0, len(urls), batch_size):
-            batch = urls[i:i+batch_size]
+        # Create temp directory for document files
+        temp_dir = Path("data/.ingest_temp")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Ingesting...", total=len(documents))
             
-            websites = [
-                WebsiteSource(
-                    bucket_id=self.bucket_id,
-                    source_url=url,
-                    depth=0,  # no crawl, just this page
-                    cap=1,
-                )
-                for url in batch
-            ]
-            
-            try:
-                console.print(f"Ingesting batch {i//batch_size + 1}...")
-                response = self.client.documents.crawl_website(websites=websites)
+            for doc in documents:
+                doc_id = doc.get("doc_id", "unknown")
+                url = doc.get("url", "unknown")
+                content = doc.get("content", "")
+                title = doc.get("title", "Untitled")
                 
-                if response and response.ingest:
-                    self.stats["success"] += len(batch)
-                else:
-                    self.stats["failed"] += len(batch)
+                result = {
+                    "doc_id": doc_id,
+                    "url": url,
+                    "title": title,
+                    "status": "pending",
+                    "error": None,
+                }
+                
+                try:
+                    # Write content to temp file
+                    temp_file = temp_dir / f"{doc_id}.txt"
+                    with open(temp_file, "w", encoding="utf-8") as f:
+                        f.write(f"# {title}\n")
+                        f.write(f"Source: {url}\n\n")
+                        f.write(content)
                     
-                time.sleep(2)  # rate limit
+                    # Create Document object
+                    gx_doc = Document(
+                        bucket_id=self.bucket_id,
+                        file_path=str(temp_file.absolute()),
+                        file_name=f"{doc_id}.txt",
+                        file_type="txt",
+                        search_data={
+                            "source_url": url,
+                            "title": title,
+                            "doc_id": doc_id,
+                        }
+                    )
+                    
+                    # Upload to GroundX
+                    response = self.client.ingest(
+                        documents=[gx_doc],
+                        wait_for_complete=True,
+                    )
+                    
+                    if response and response.ingest:
+                        result["status"] = "success"
+                        result["process_id"] = response.ingest.process_id
+                        self.stats["success"] += 1
+                        logger.info(f"✓ Ingested: {doc_id} ({url})")
+                    else:
+                        result["status"] = "failed"
+                        result["error"] = "No response from API"
+                        self.stats["failed"] += 1
+                        logger.warning(f"✗ No response: {doc_id}")
+                    
+                except Exception as e:
+                    result["status"] = "failed"
+                    result["error"] = str(e)
+                    self.stats["failed"] += 1
+                    logger.error(f"✗ Failed: {doc_id} - {e}")
                 
-            except Exception as e:
-                logger.error(f"Batch failed: {e}")
-                self.stats["failed"] += len(batch)
+                self.results.append(result)
+                progress.update(task, advance=1)
+                
+                # Small delay to avoid rate limiting
+                time.sleep(0.5)
+        
+        # Cleanup temp files
+        for f in temp_dir.glob("*.txt"):
+            f.unlink()
+        temp_dir.rmdir()
+        
+        # Save audit log
+        self._save_audit_log()
         
         return self.stats
     
+    def _save_audit_log(self):
+        """Save per-document ingestion results to log file."""
+        log_path = Path("logs/ingestion_audit.json")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        audit = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "bucket_id": self.bucket_id,
+            "stats": self.stats,
+            "documents": self.results,
+        }
+        
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(audit, f, indent=2)
+        
+        logger.info(f"Audit log saved: {log_path}")
+    
     def print_summary(self):
-        """Display results."""
+        """Display ingestion results."""
         console.print("\n" + "=" * 50)
         console.print("[bold green]Ingestion Complete[/bold green]")
         console.print("=" * 50)
@@ -201,10 +186,23 @@ class GroundXIngestor:
         table.add_column("Value", justify="right")
         
         table.add_row("Bucket ID", str(self.bucket_id))
-        table.add_row("Process ID", str(self.process_id) if self.process_id else "N/A")
-        table.add_row("Status", "[green]Success[/green]" if self.stats["success"] else "[red]Failed[/red]")
+        table.add_row("Total Documents", str(self.stats["total"]))
+        table.add_row("Successful", f"[green]{self.stats['success']}[/green]")
+        table.add_row("Failed", f"[red]{self.stats['failed']}[/red]")
+        
+        success_rate = (self.stats["success"] / self.stats["total"] * 100) if self.stats["total"] > 0 else 0
+        table.add_row("Success Rate", f"{success_rate:.1f}%")
         
         console.print(table)
+        
+        # Show failed documents if any
+        failed = [r for r in self.results if r["status"] == "failed"]
+        if failed:
+            console.print("\n[bold red]Failed Documents:[/bold red]")
+            for r in failed[:5]:  # Show first 5
+                console.print(f"  • {r['doc_id']}: {r['error']}")
+            if len(failed) > 5:
+                console.print(f"  ... and {len(failed) - 5} more")
 
 
 def main():
@@ -217,15 +215,12 @@ def main():
     
     try:
         ingestor = GroundXIngestor()
-        
-        # use GroundX native crawler
-        ingestor.ingest_website(
-            base_url="https://www.itnb.ch/en",
-            depth=3,
-            cap=50
-        )
+        ingestor.ingest_from_json()
         ingestor.print_summary()
         
+    except FileNotFoundError as e:
+        console.print(f"[bold yellow]{e}[/bold yellow]")
+        console.print("[dim]Run 'python -m src.scraper' first to scrape website content.[/dim]")
     except Exception as e:
         logger.exception(f"Ingestion failed: {e}")
         console.print(f"[bold red]Error: {e}[/bold red]")

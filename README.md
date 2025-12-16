@@ -9,6 +9,9 @@ A lightweight RAG pipeline that scrapes `itnb.ch`, indexes it into GroundX, and 
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+
+# Required for crawl4ai (Playwright browser automation)
+playwright install
 ```
 
 ### 2. Config
@@ -20,15 +23,16 @@ cp .env.example .env
 ### 3. Run Pipeline
 The pipeline is split into 3 steps:
 
-1. **Scrape**: Crawls the site and saves raw content.
+1. **Scrape**: Crawls the site and saves raw content to `data/`.
    ```bash
    python -m src.scraper
    ```
 
-2. **Ingest**: Uploads/indexes content to GroundX.
+2. **Ingest**: Reads local scraped data and uploads to GroundX.
    ```bash
    python -m src.ingest
    ```
+   - Per-document success/failure is logged to `logs/ingestion_audit.json`.
 
 3. **Chat**: Run the interactive CLI.
    ```bash
@@ -37,14 +41,13 @@ The pipeline is split into 3 steps:
 
 ## Stack
 
-- **Ingestion**: `crawl4ai` (scraping), `GroundX` (vector store & retrieval)
-- **RAG**: `OpenAI` client (connecting to Llama 4 endpoint)
+- **Scraping**: `crawl4ai` (Playwright-based async crawler)
+- **Vector Store**: `GroundX` (managed RAG infrastructure)
+- **LLM**: `OpenAI` client (connecting to Llama 4 endpoint)
 - **CLI**: `rich`, `loguru`
 
 ## Notes
 
 - **Security**: Keys are loaded from `.env` via `pydantic-settings`. Do not commit this file.
-- **Scraper**: Configured to ignore non-English pages and static assets (PDF/images) to keep the index clean.
-- **Rate Limits**: The ingest script has a small delay between batches if running in local mode, though the GroundX crawler handles most of this.
-
-- **Rate Limits**: The ingest script has a small delay between batches if running in local mode, though the GroundX crawler handles most of this.
+- **Scraper**: Configured to ignore non-English pages and static assets (PDF/images).
+- **Audit Trail**: All ingestion results are logged per-document in `logs/ingestion_audit.json`.
